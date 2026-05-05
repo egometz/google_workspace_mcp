@@ -171,10 +171,9 @@ async def _resolve_dm_space_names(
         try:
             async with membership_semaphore:
                 response = await asyncio.to_thread(
-                    lambda: chat_service.spaces()
-                    .members()
-                    .list(parent=space_id)
-                    .execute()
+                    lambda: (
+                        chat_service.spaces().members().list(parent=space_id).execute()
+                    )
                 )
         except HttpError as e:
             logger.debug(f"Chat memberships lookup failed for {space_id}: {e}")
