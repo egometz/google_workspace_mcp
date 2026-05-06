@@ -3,11 +3,75 @@ import argparse
 import json
 import logging
 import os
+import secrets
 import socket
 import sys
 from functools import partial
 from importlib import metadata, import_module
 from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Bearer-token auth middleware (Railway / public HTTP deploy)
+# ---------------------------------------------------------------------------
+
+# Paths that must stay public -- no bearer token required.
+# /oauth2callback: Google's browser redirect; doesn't carry our bearer token.
+# /health, /:     Railway health probes.
+PUBLIC_PATHS = frozenset({"/oauth2callback", "/health", "/healthz", "/"})
+
+
+class BearerTokenMiddleware:
+    'ASGI middleware: reject requests without a valid Authorization Bearer token.'
+
+    def __init__(self, app, expected_token):
+        self.app = app
+        self._expected = expected_token
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get('path', '')
+        if path in PUBLIC_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        if not self._expected:
+            await _send_json_error(send, 503, 'Server misconfigured: MCP_SERVER_AUTH_TOKEN not set')
+            return
+
+        headers = dict(scope.get('headers', []))
+        auth_header = headers.get(b'authorization', b'').decode('latin-1')
+        scheme, _, token = auth_header.partition(' ')
+
+        if scheme.lower() != 'bearer' or not token:
+            await _send_json_error(send, 401, 'Missing bearer token')
+            return
+
+        if not secrets.compare_digest(token, self._expected):
+            await _send_json_error(send, 401, 'Invalid bearer token')
+            return
+
+        await self.app(scope, receive, send)
+
+
+async def _send_json_error(send, status_code, message):
+    'Send a minimal JSON error response without depending on Starlette.'
+    import json as _json
+    body = _json.dumps({'error': message}).encode()
+    await send(
+        {
+            'type': 'http.response.start',
+            'status': status_code,
+            'headers': [
+                (b'content-type', b'application/json'),
+                (b'content-length', str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({'type': 'http.response.body', 'body': body, 'more_body': False})
+
 
 # Prevent any stray startup output on macOS (e.g. platform identifiers) from
 # corrupting the MCP JSON-RPC handshake on stdout. We capture anything written
@@ -758,11 +822,33 @@ def main():
                 )
                 sys.exit(1)
 
-            server.run(
-                transport="streamable-http",
+            # Validate bearer auth token before binding the socket (fail-fast).
+            _auth_token = os.environ.get("MCP_SERVER_AUTH_TOKEN", "").strip()
+            if not _auth_token:
+                safe_print("❌ MCP_SERVER_AUTH_TOKEN must be set for streamable-http transport.")
+                safe_print(
+                    "   Generate one: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+                )
+                sys.exit(1)
+
+            import uvicorn as _uvicorn
+
+            # Get the FastMCP ASGI app (SecureFastMCP.http_app already adds
+            # WellKnownCacheControl + MCPSession middleware), then wrap it with
+            # our bearer-token guard before handing off to uvicorn.
+            _asgi_app = server.http_app(
+                path="/mcp", stateless_http=is_stateless_mode()
+            )
+            _guarded_app = BearerTokenMiddleware(_asgi_app, _auth_token)
+
+            safe_print("   Bearer auth: enabled (MCP_SERVER_AUTH_TOKEN is set)")
+            safe_print(f"   Public paths: {sorted(PUBLIC_PATHS)}")
+
+            _uvicorn.run(
+                _guarded_app,
                 host=host,
                 port=port,
-                stateless_http=is_stateless_mode(),
+                log_level="info",
             )
         else:
             if http_port is not None:
