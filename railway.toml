@@ -7,4 +7,4 @@ healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
-startCommand = "uv run main.py --transport streamable-http"
+startCommand = "uv run main.py --transport streamable-http --tools drive docs sheets calendar tasks"
