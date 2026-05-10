@@ -1824,6 +1824,186 @@ async def update_drive_file(
 
 
 @server.tool(
+    title="Update Drive File Content",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("update_drive_file_content", is_read_only=False, service_type="drive")
+@require_google_service("drive", "drive_file")
+async def update_drive_file_content(
+    service,
+    file_id: str,
+    user_google_email: str,
+    content: Optional[str] = None,
+    fileUrl: Optional[str] = None,
+    mime_type: str = "text/plain",
+) -> str:
+    """
+    Replaces the content of an existing Google Drive file, preserving its metadata.
+    Accepts either direct content or a fileUrl to fetch the content from.
+
+    Args:
+        file_id (str): The ID of the file to update. Required.
+        user_google_email (str): The user's Google email address. Required.
+        content (Optional[str]): If provided, the new content to write to the file.
+        fileUrl (Optional[str]): If provided, fetches new file content from this URL.
+            Supports http:// and https:// protocols. SSRF-safe.
+        mime_type (str): The MIME type of the content. Defaults to 'text/plain'.
+
+    Returns:
+        str: Confirmation message with file ID and link.
+    """
+    logger.info(
+        f"[update_drive_file_content] Invoked. Email: '{user_google_email}', "
+        f"File ID: '{file_id}', fileUrl: {fileUrl}"
+    )
+
+    if content is None and fileUrl is None:
+        raise Exception("You must provide either 'content' or 'fileUrl'.")
+
+    resolved_file_id, current_file = await resolve_drive_item(
+        service,
+        file_id,
+        extra_fields="name, webViewLink",
+    )
+    file_id = resolved_file_id
+
+    if fileUrl:
+        parsed_url = urlparse(fileUrl)
+        if parsed_url.scheme not in ("http", "https"):
+            if not parsed_url.scheme:
+                raise Exception(
+                    "fileUrl is missing a URL scheme. Use http:// or https://."
+                )
+            raise Exception(
+                f"Unsupported URL scheme '{parsed_url.scheme}'. "
+                "Only http:// and https:// are supported for update_drive_file_content."
+            )
+
+        logger.info(f"[update_drive_file_content] Fetching content from URL: {fileUrl}")
+
+        if is_stateless_mode():
+            with SpooledTemporaryFile(max_size=UPLOAD_CHUNK_SIZE_BYTES) as spool:
+
+                async def _write_spool(chunk: bytes) -> None:
+                    await asyncio.to_thread(spool.write, chunk)
+
+                _total, content_type = await _stream_url_with_validation(
+                    fileUrl, _write_spool
+                )
+                await asyncio.to_thread(spool.seek, 0)
+
+                if content_type and content_type != "application/octet-stream":
+                    mime_type = content_type
+                    logger.info(
+                        f"[update_drive_file_content] Using MIME type from "
+                        f"Content-Type header: {content_type}"
+                    )
+
+                media = MediaIoBaseUpload(
+                    spool,
+                    mimetype=mime_type,
+                    resumable=True,
+                    chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+                )
+
+                updated_file = await asyncio.to_thread(
+                    service.files()
+                    .update(
+                        fileId=file_id,
+                        media_body=media,
+                        fields="id, name, webViewLink",
+                        supportsAllDrives=True,
+                    )
+                    .execute,
+                    num_retries=GOOGLE_API_WRITE_RETRIES,
+                )
+        else:
+            with NamedTemporaryFile() as temp_file:
+
+                async def _write_chunk(chunk: bytes) -> None:
+                    await asyncio.to_thread(temp_file.write, chunk)
+
+                total_bytes, content_type = await _stream_url_with_validation(
+                    fileUrl, _write_chunk
+                )
+
+                logger.info(
+                    f"[update_drive_file_content] Downloaded {total_bytes} bytes "
+                    f"from URL before upload."
+                )
+
+                if content_type and content_type != "application/octet-stream":
+                    mime_type = content_type
+                    logger.info(
+                        f"[update_drive_file_content] Using MIME type from "
+                        f"Content-Type header: {content_type}"
+                    )
+
+                temp_file.seek(0)
+
+                media = MediaIoBaseUpload(
+                    temp_file,
+                    mimetype=mime_type,
+                    resumable=True,
+                    chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+                )
+
+                logger.info(
+                    "[update_drive_file_content] Starting content update on Google Drive..."
+                )
+                updated_file = await asyncio.to_thread(
+                    service.files()
+                    .update(
+                        fileId=file_id,
+                        media_body=media,
+                        fields="id, name, webViewLink",
+                        supportsAllDrives=True,
+                    )
+                    .execute,
+                    num_retries=GOOGLE_API_WRITE_RETRIES,
+                )
+
+    else:
+        # Direct content string path
+        file_data = content.encode("utf-8")
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_data),
+            mimetype=mime_type,
+            resumable=True,
+        )
+
+        logger.info(
+            "[update_drive_file_content] Starting content update on Google Drive..."
+        )
+        updated_file = await asyncio.to_thread(
+            service.files()
+            .update(
+                fileId=file_id,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
+
+    link = updated_file.get("webViewLink", "No link available")
+    confirmation_message = (
+        f"Successfully updated content of file "
+        f"'{updated_file.get('name', file_id)}' "
+        f"(ID: {updated_file.get('id', file_id)}) "
+        f"for {user_google_email}. Link: {link}"
+    )
+    logger.info(f"[update_drive_file_content] Done. Link: {link}")
+    return confirmation_message
+
+
+@server.tool(
     title="Get Drive Shareable Link",
     annotations=ToolAnnotations(
         readOnlyHint=True,
