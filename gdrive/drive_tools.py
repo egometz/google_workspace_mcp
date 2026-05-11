@@ -882,6 +882,9 @@ async def create_drive_folder(
     )
 
 
+BASE64_CONTENT_MAX_BYTES = 25 * 1024 * 1024  # 25 MB cap for base64Content uploads
+
+
 @server.tool(
     title="Create Drive File",
     annotations=ToolAnnotations(
@@ -891,7 +894,6 @@ async def create_drive_folder(
         openWorldHint=True,
     ),
 )
-BASE64_CONTENT_MAX_BYTES = 25 * 1024 * 1024  # 25 MB cap for base64Content uploads
 
 
 @handle_http_errors("create_drive_file", service_type="drive")
