@@ -891,6 +891,9 @@ async def create_drive_folder(
         openWorldHint=True,
     ),
 )
+BASE64_CONTENT_MAX_BYTES = 25 * 1024 * 1024  # 25 MB cap for base64Content uploads
+
+
 @handle_http_errors("create_drive_file", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def create_drive_file(
@@ -901,10 +904,11 @@ async def create_drive_file(
     folder_id: str = "root",
     mime_type: str = "text/plain",
     fileUrl: Optional[str] = None,  # Now explicitly Optional
+    base64Content: Optional[str] = None,  # Base64-encoded binary content (max 25 MB decoded)
 ) -> str:
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
-    Accepts either direct content or a fileUrl to fetch the content from.
+    Accepts either direct content, a fileUrl, or base64-encoded binary content.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -913,16 +917,23 @@ async def create_drive_file(
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
         fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        base64Content (Optional[str]): If provided, base64-decoded bytes are uploaded directly. Use for binary files (PDFs, images, Office docs) that cannot be passed as UTF-8 text. Caller must set mime_type correctly (e.g. 'application/pdf'). Maximum decoded size: 25 MB.
 
     Returns:
         str: Confirmation message of the successful file creation with file link.
     """
     logger.info(
-        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}"
+        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}, base64Content: {'<set>' if base64Content else None}"
     )
 
-    if content is None and fileUrl is None and mime_type != FOLDER_MIME_TYPE:
-        raise Exception("You must provide either 'content' or 'fileUrl'.")
+    # Validate mutual exclusivity of content sources
+    sources_set = sum(1 for x in [content, fileUrl, base64Content] if x is not None)
+    if sources_set > 1:
+        raise Exception(
+            "Provide only one of: 'content', 'fileUrl', or 'base64Content'. They are mutually exclusive."
+        )
+    if sources_set == 0 and mime_type != FOLDER_MIME_TYPE:
+        raise Exception("You must provide one of: 'content', 'fileUrl', or 'base64Content'.")
 
     # Create folder (no content or media_body). Prefer create_drive_folder for new code.
     if mime_type == FOLDER_MIME_TYPE:
@@ -1103,6 +1114,34 @@ async def create_drive_file(
             raise Exception(
                 f"Unsupported URL scheme '{parsed_url.scheme}'. Only file://, http://, and https:// are supported."
             )
+    elif base64Content is not None:
+        try:
+            file_bytes = base64.b64decode(base64Content)
+        except Exception as exc:
+            raise Exception(f"base64Content could not be decoded: {exc}") from exc
+
+        decoded_size = len(file_bytes)
+        if decoded_size > BASE64_CONTENT_MAX_BYTES:
+            raise Exception(
+                f"base64Content decoded size ({decoded_size:,} bytes) exceeds the "
+                f"25 MB cap ({BASE64_CONTENT_MAX_BYTES:,} bytes). Use fileUrl for larger uploads."
+            )
+
+        logger.info(f"[create_drive_file] base64Content decoded: {decoded_size:,} bytes")
+        media = io.BytesIO(file_bytes)
+
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=MediaIoBaseUpload(media, mimetype=mime_type, resumable=True),
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
+
     elif content is not None:
         file_data = content.encode("utf-8")
         media = io.BytesIO(file_data)
@@ -1841,10 +1880,11 @@ async def update_drive_file_content(
     content: Optional[str] = None,
     fileUrl: Optional[str] = None,
     mime_type: str = "text/plain",
+    base64Content: Optional[str] = None,  # Base64-encoded binary content (max 25 MB decoded)
 ) -> str:
     """
     Replaces the content of an existing Google Drive file, preserving its metadata.
-    Accepts either direct content or a fileUrl to fetch the content from.
+    Accepts either direct content, a fileUrl, or base64-encoded binary content.
 
     Args:
         file_id (str): The ID of the file to update. Required.
@@ -1853,17 +1893,23 @@ async def update_drive_file_content(
         fileUrl (Optional[str]): If provided, fetches new file content from this URL.
             Supports http:// and https:// protocols. SSRF-safe.
         mime_type (str): The MIME type of the content. Defaults to 'text/plain'.
+        base64Content (Optional[str]): If provided, base64-decoded bytes are uploaded directly. Use for binary files (PDFs, images, Office docs) that cannot be passed as UTF-8 text. Caller must set mime_type correctly (e.g. 'application/pdf'). Maximum decoded size: 25 MB.
 
     Returns:
         str: Confirmation message with file ID and link.
     """
     logger.info(
         f"[update_drive_file_content] Invoked. Email: '{user_google_email}', "
-        f"File ID: '{file_id}', fileUrl: {fileUrl}"
+        f"File ID: '{file_id}', fileUrl: {fileUrl}, base64Content: {'<set>' if base64Content else None}"
     )
 
-    if content is None and fileUrl is None:
-        raise Exception("You must provide either 'content' or 'fileUrl'.")
+    sources_set = sum(1 for x in [content, fileUrl, base64Content] if x is not None)
+    if sources_set > 1:
+        raise Exception(
+            "Provide only one of: 'content', 'fileUrl', or 'base64Content'. They are mutually exclusive."
+        )
+    if sources_set == 0:
+        raise Exception("You must provide one of: 'content', 'fileUrl', or 'base64Content'.")
 
     resolved_file_id, current_file = await resolve_drive_item(
         service,
@@ -1967,6 +2013,39 @@ async def update_drive_file_content(
                     .execute,
                     num_retries=GOOGLE_API_WRITE_RETRIES,
                 )
+
+    elif base64Content is not None:
+        try:
+            file_bytes = base64.b64decode(base64Content)
+        except Exception as exc:
+            raise Exception(f"base64Content could not be decoded: {exc}") from exc
+
+        decoded_size = len(file_bytes)
+        if decoded_size > BASE64_CONTENT_MAX_BYTES:
+            raise Exception(
+                f"base64Content decoded size ({decoded_size:,} bytes) exceeds the "
+                f"25 MB cap ({BASE64_CONTENT_MAX_BYTES:,} bytes). Use fileUrl for larger uploads."
+            )
+
+        logger.info(f"[update_drive_file_content] base64Content decoded: {decoded_size:,} bytes")
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_bytes),
+            mimetype=mime_type,
+            resumable=True,
+        )
+
+        logger.info("[update_drive_file_content] Starting content update on Google Drive...")
+        updated_file = await asyncio.to_thread(
+            service.files()
+            .update(
+                fileId=file_id,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
 
     else:
         # Direct content string path
