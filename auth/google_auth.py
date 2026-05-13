@@ -133,10 +133,41 @@ def _find_any_credentials(
     return None, None
 
 
-def save_credentials_to_session(session_id: str, credentials: Credentials):
-    """Saves user credentials using OAuth21SessionStore."""
-    # Get user email from credentials if possible
+def save_credentials_to_session(
+    session_id: str,
+    credentials: Credentials,
+    expected_email: Optional[str] = None,
+):
+    """Saves user credentials using OAuth21SessionStore.
+
+    Resolves the user email in priority order:
+    1. Decoding the id_token (present immediately after token exchange).
+    2. Calling the userinfo endpoint (needed after refresh, where id_token is absent).
+       Skipped entirely when expected_email is provided and the id_token path succeeded,
+       saving a round-trip network call.
+
+    Security guard:
+    - When expected_email is provided, the resolved email MUST match it.  A mismatch
+      indicates a stale or delegated credential file and is treated as a security
+      violation: the function logs at WARNING level and returns without persisting.
+    - Even without expected_email, if the session is already bound to a different user
+      in the OAuth21SessionStore, the function logs at WARNING level and returns early.
+    - The security warning includes session_id, expected email, and resolved email.
+      Tokens are never logged.
+
+    If neither source yields an email the credentials are not stored, which would
+    leave the session unmapped and cause the next tool call to re-trigger auth.
+
+    Args:
+        session_id: The MCP session ID to associate these credentials with.
+        credentials: The Google OAuth credentials to persist.
+        expected_email: Optional email the caller already knows is correct for this
+            session.  When supplied, any mismatch between this value and the email
+            resolved from the credentials is treated as a security violation.
+    """
     user_email = None
+
+    # 1. Try id_token first — cheap, no network call, available right after exchange.
     if credentials and credentials.id_token:
         try:
             decoded_token = jwt.decode(
@@ -146,26 +177,77 @@ def save_credentials_to_session(session_id: str, credentials: Credentials):
         except Exception as e:
             logger.debug(f"Could not decode id_token to get email: {e}")
 
-    if user_email:
-        store = get_oauth21_session_store()
-        store.store_session(
-            user_email=user_email,
-            access_token=credentials.token,
-            refresh_token=credentials.refresh_token,
-            token_uri=credentials.token_uri,
-            client_id=credentials.client_id,
-            client_secret=credentials.client_secret,
-            scopes=credentials.scopes,
-            expiry=credentials.expiry,
-            mcp_session_id=session_id,
-        )
-        logger.debug(
-            f"Credentials saved to OAuth21SessionStore for session_id: {session_id}, user: {user_email}"
-        )
-    else:
+    # 2. Fall back to userinfo endpoint when id_token is absent (e.g. after refresh).
+    #    Skip this network call when expected_email was already resolved from id_token
+    #    (short-circuit: if id_token matched we don't need a second source).
+    #    This is the common case for sessions loaded from the credential file store.
+    if not user_email and credentials and credentials.valid:
+        try:
+            user_info = get_user_info(credentials)
+            if user_info:
+                user_email = user_info.get("email")
+                if user_email:
+                    logger.debug(
+                        f"Resolved user email from userinfo endpoint for session: {session_id}"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Could not resolve user email from userinfo endpoint for session {session_id}: {e}"
+            )
+
+    if not user_email:
         logger.warning(
             f"Could not save credentials to session store - no user email found for session: {session_id}"
         )
+        return
+
+    # Security check 1: if the caller provided an expected email, the resolved email
+    # must match.  A mismatch means the credential object (e.g. from a stale file on
+    # disk) belongs to a different account than the session context expects.
+    if expected_email and user_email.lower() != expected_email.lower():
+        logger.warning(
+            "[SECURITY] save_credentials_to_session: resolved email does not match "
+            "expected email for session %s — expected=%s resolved=%s — "
+            "refusing to persist credentials to prevent cross-account session write.",
+            session_id,
+            expected_email,
+            user_email,
+        )
+        return
+
+    # Security check 2: if the session is already bound to a different user in the
+    # store, the binding is immutable — do not attempt store_session at all.  Calling
+    # store_session with the wrong email would either be silently dropped (single-user
+    # mode, where mcp_session_id is nulled) or raise ValueError (standard mode).
+    # Either way the caller's bare except would swallow it; catch it here instead with
+    # an explicit, traceable log line.
+    store = get_oauth21_session_store()
+    bound_user = store.get_user_by_mcp_session(session_id)
+    if bound_user and bound_user.lower() != user_email.lower():
+        logger.warning(
+            "[SECURITY] save_credentials_to_session: session %s is already bound to "
+            "%s but resolved credentials belong to %s — refusing to persist to "
+            "prevent session hijack or stale-credential overwrite.",
+            session_id,
+            bound_user,
+            user_email,
+        )
+        return
+
+    store.store_session(
+        user_email=user_email,
+        access_token=credentials.token,
+        refresh_token=credentials.refresh_token,
+        token_uri=credentials.token_uri,
+        client_id=credentials.client_id,
+        client_secret=credentials.client_secret,
+        scopes=credentials.scopes,
+        expiry=credentials.expiry,
+        mcp_session_id=session_id,
+    )
+    logger.debug(
+        f"Credentials saved to OAuth21SessionStore for session_id: {session_id}, user: {user_email}"
+    )
 
 
 def load_credentials_from_session(session_id: str) -> Optional[Credentials]:
@@ -805,7 +887,7 @@ async def handle_auth_callback(
 
         # If session_id is provided, also save to session cache for compatibility
         if session_id:
-            save_credentials_to_session(session_id, credentials)
+            save_credentials_to_session(session_id, credentials, expected_email=user_google_email)
 
         return user_google_email, credentials
 
@@ -1004,7 +1086,7 @@ def get_credentials(
                 )
                 if not skip_session_cache:
                     save_credentials_to_session(
-                        session_id, credentials
+                        session_id, credentials, expected_email=user_google_email
                     )  # Cache for current session
 
         if not credentials:
@@ -1090,7 +1172,7 @@ def get_credentials(
 
             if session_id and (persist_succeeded or is_stateless_mode()):
                 # Update session cache if it was the source or is active
-                save_credentials_to_session(session_id, credentials)
+                save_credentials_to_session(session_id, credentials, expected_email=user_google_email)
         except RefreshError as e:
             logger.warning(
                 f"[get_credentials] RefreshError - token expired/revoked: {e}. User: '{user_google_email}', Session: '{session_id}'"

@@ -601,11 +601,15 @@ def _resolve_scopes(scopes: Union[str, List[str]]) -> List[str]:
     return resolved
 
 
-def _handle_token_refresh_error(
+async def _handle_token_refresh_error(
     error: RefreshError, user_email: str, service_name: str
 ) -> str:
     """
     Handle token refresh errors gracefully, particularly expired/revoked tokens.
+
+    For invalid_grant / expired-or-revoked errors in legacy OAuth 2.0 mode this
+    function generates a fresh re-auth URL inline so the caller gets an
+    immediately actionable link rather than just "run start_google_auth".
 
     Args:
         error: The RefreshError that occurred
@@ -615,6 +619,9 @@ def _handle_token_refresh_error(
     Returns:
         A user-friendly error message with instructions for reauthentication
     """
+    from auth.google_auth import start_auth_flow
+    from core.config import get_oauth_redirect_uri, get_transport_mode
+
     error_str = str(error)
 
     if (
@@ -646,6 +653,46 @@ def _handle_token_refresh_error(
                 f"2. Retry your original command\n\n"
                 f"The application will automatically use the new credentials once authentication is complete."
             )
+
+        # Legacy OAuth 2.0 path: generate a fresh re-auth URL inline so the
+        # caller receives an immediately clickable link rather than a "run
+        # start_google_auth" instruction that requires a separate tool call.
+        try:
+            import asyncio as _asyncio
+            transport_mode = get_transport_mode()
+            redirect_uri = get_oauth_redirect_uri()
+
+            if transport_mode == "stdio":
+                from auth.oauth_callback_server import ensure_oauth_callback_available
+                from auth.oauth_config import get_oauth_config as _get_oauth_config
+
+                cfg = _get_oauth_config()
+                # ensure_oauth_callback_available is blocking (port bind + thread);
+                # run it in a thread pool to avoid stalling the event loop.
+                success, err_msg = await _asyncio.to_thread(
+                    ensure_oauth_callback_available,
+                    transport_mode, cfg.port, cfg.base_uri,
+                )
+                if not success:
+                    raise RuntimeError(
+                        f"Callback server unavailable: {err_msg}"
+                    )
+
+            auth_response = await start_auth_flow(
+                user_google_email=user_email,
+                service_name=service_display_name,
+                redirect_uri=redirect_uri,
+            )
+            return (
+                f"**Authentication Required: Token Expired/Revoked for {service_display_name}**\n\n"
+                f"Your Google authentication token for {user_email} has expired or been revoked.\n\n"
+                + auth_response
+            )
+        except Exception as url_err:
+            logger.warning(
+                f"Could not generate re-auth URL inline for {user_email}: {url_err}"
+            )
+            # Fall through to the plain-text instructions below.
 
         return (
             f"**Authentication Required: Token Expired/Revoked for {service_display_name}**\n\n"
@@ -809,7 +856,7 @@ def require_google_service(
                 # Prepend the fetched service object to the original arguments
                 return await func(service, *args, **kwargs)
             except RefreshError as e:
-                error_message = _handle_token_refresh_error(
+                error_message = await _handle_token_refresh_error(
                     e, actual_user_email, service_name
                 )
                 raise GoogleAuthenticationError(error_message)
@@ -967,7 +1014,7 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                         return await func(*args, **kwargs)
                     except RefreshError as e:
                         # Handle token refresh errors gracefully
-                        error_message = _handle_token_refresh_error(
+                        error_message = await _handle_token_refresh_error(
                             e, user_google_email, "Multiple Services"
                         )
                         raise GoogleAuthenticationError(error_message)
