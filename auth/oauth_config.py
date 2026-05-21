@@ -55,13 +55,13 @@ class OAuthConfig:
             )
 
         # Stateless mode configuration
+        # Stateless HTTP is an orthogonal transport concern and does not require
+        # OAuth 2.1. The guard requiring MCP_ENABLE_OAUTH21=true has been removed
+        # so that bearer-token deployments can use stateless_http=True without
+        # enabling the full OAuth 2.1 protocol stack.
         self.stateless_mode = (
             os.getenv("WORKSPACE_MCP_STATELESS_MODE", "false").lower() == "true"
         )
-        if self.stateless_mode and not self.oauth21_enabled:
-            raise ValueError(
-                "WORKSPACE_MCP_STATELESS_MODE requires MCP_ENABLE_OAUTH21=true"
-            )
 
         # Service account (domain-wide delegation) configuration
         self.service_account_key_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY_FILE")
