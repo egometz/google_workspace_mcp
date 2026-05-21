@@ -836,8 +836,18 @@ def main():
             # Get the FastMCP ASGI app (SecureFastMCP.http_app already adds
             # WellKnownCacheControl + MCPSession middleware), then wrap it with
             # our bearer-token guard before handing off to uvicorn.
+            #
+            # WORKSPACE_MCP_STATELESS_HTTP controls the FastMCP SDK's
+            # stateless_http transport parameter (session-per-request, no
+            # server-side session state).  It is independent of
+            # WORKSPACE_MCP_STATELESS_MODE, which governs credential-skip
+            # behaviour.  Set WORKSPACE_MCP_STATELESS_HTTP=true to make
+            # container restarts invisible to clients.
+            _stateless_http = (
+                os.environ.get("WORKSPACE_MCP_STATELESS_HTTP", "").lower() == "true"
+            )
             _asgi_app = server.http_app(
-                path="/mcp", stateless_http=is_stateless_mode()
+                path="/mcp", stateless_http=_stateless_http
             )
             _guarded_app = BearerTokenMiddleware(_asgi_app, _auth_token)
 
